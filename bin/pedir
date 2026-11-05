@@ -34,10 +34,9 @@ estado_py() { python3 - "$ESTADO" "$@" <<'PY'
 import sys, json, os, fcntl, datetime
 path, acao = sys.argv[1], sys.argv[2]
 agora = datetime.datetime.now()
-open(path, "a").close()
-with open(path, "r+") as f:
-    fcntl.flock(f, fcntl.LOCK_EX)
-    try: d = json.loads(f.read() or "{}")
+with open(path + ".lock", "a") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try: d = json.load(open(path))
     except Exception: d = {}
     if acao == "banco":            # banco <agente> <horas>
         ag, h = sys.argv[3], float(sys.argv[4])
@@ -52,13 +51,16 @@ with open(path, "r+") as f:
         ativos = {k: v for k, v in d.items() if datetime.datetime.fromisoformat(v["limite_ate"]) > agora}
         if not ativos: print("Todos os agentes disponíveis.")
         for k, v in ativos.items(): print(f"{k}: no banco desde {v['desde']} até ~{v['limite_ate']}")
-    f.seek(0); f.truncate(); f.write(json.dumps(d, indent=1))
+    if acao in ("banco", "livre"):  # escrita atómica: uma interrupção nunca deixa o ficheiro vazio
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f: f.write(json.dumps(d, indent=1))
+        os.replace(tmp, path)
 PY
 }
 
 case ${1:-} in
-  --estado) estado_py mostrar; exit 0 ;;
-  --livre)  [ $# -ge 2 ] || usage; estado_py livre "$2"; echo "$2 de volta ao jogo."; exit 0 ;;
+  --estado) estado_py mostrar; exit ;;
+  --livre)  [ $# -ge 2 ] || usage; estado_py livre "$2" && echo "$2 de volta ao jogo."; exit ;;
 esac
 
 [ $# -ge 1 ] || usage
@@ -82,11 +84,20 @@ ORDEM=""
 ORDEM=$(for a in $ORDEM; do [ "$a" != "$ORIGEM" ] && echo -n "$a "; done)
 [ -n "$ORDEM" ] || { echo "[pedir] nenhum agente disponível para chamar" >&2; exit 2; }
 
+# Limpeza por sinais: termina o agente em curso (e o filho do timeout), o vigia e apaga temporários
+AGPID=""; VIGIA=""; CUR_TMP=""
+limpar() {
+  for p in $AGPID $VIGIA; do pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done
+  [ -n "$CUR_TMP" ] && rm -rf "$CUR_TMP"
+}
+trap 'echo "[pedir] interrompido — a limpar" >&2; limpar; exit 130' INT TERM HUP
+esperar() { AGPID=$!; wait "$AGPID"; RC=$?; AGPID=""; }
+
 termux_env() { timeout -k 10 "${PEDIR_TIMEOUT:-600}" env HOME=$TH PREFIX=$TP TMPDIR=$TP/tmp TERMUX_VERSION=${TERMUX_VERSION:-0.118.3} PATH=$TP/bin:/usr/bin:/bin "$@"; }
 
-# Corre um agente. Código: 0 ok · 3 limite · 4 indisponível · 5 quota pesquisa · 1 erro
+# Corre um agente. Código: 0 ok · 3 limite · 4 indisponível · 5 quota pesquisa · 6 interrompido (repetível) · 1 erro
 correr() {
-  local AG=$1 ANTERIOR=$2 TMP RC SEG PROMPT NOTA=""
+  local AG=$1 ANTERIOR=$2 TMP SEG PROMPT NOTA=""
   [ -n "$ANTERIOR" ] && NOTA="
 [Braçadeira: substituis o $ANTERIOR, que está sem tokens/indisponível. Se a tarefa for longa, regista o progresso em ~/shared/temas/ para quem continuar.]"
   PROMPT="[Pedido de $ORIGEM via 'pedir' | tipo: $TIPO | modo: $MODO]$NOTA
@@ -94,6 +105,7 @@ Faz só o que é pedido. Resposta concisa: sem repetir o enunciado, sem introdu�
 
 $PEDIDO"
   TMP=$(mktemp -d "$TP/tmp/pedir.XXXXXX") || return 1
+  CUR_TMP=$TMP
   SECONDS=0
   if [ -n "${PEDIR_SIMULAR_LIMITE:-}" ] && [ "$AG" = "$PEDIR_SIMULAR_LIMITE" ]; then
     echo "simulated rate limit reached" > "$TMP/err"; : > "$TMP/out"; RC=1   # só para testes
@@ -101,7 +113,7 @@ $PEDIDO"
     codex)
       local SB=read-only; [ $MODO = escrita ] && SB=workspace-write
       (cd "$TH" && termux_env codex exec --json --skip-git-repo-check --sandbox $SB \
-          -o "$TMP/resp.txt" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$? ;;
+          -o "$TMP/resp.txt" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar ;;
     gemini)
       local AM=plan
       [ "$MODO" = escrita ] && AM=accept-edits
@@ -114,7 +126,7 @@ while True:
     time.sleep(20)
     n += 20
     print(f"[pedir] Antigravity ainda a trabalhar ({n}s)…", flush=True)' >&2 &
-      local VIGIA=$!
+      VIGIA=$!
       # Só API: --settings força modelProvider=gemini por chamada; nunca usa o login pessoal.
       (cd "$TH/shared" || exit 1
          set -a
@@ -122,15 +134,15 @@ while True:
          set +a
          [ -n "${GEMINI_API_KEY:-}" ] || { echo "[pedir] falta GEMINI_API_KEY; não uso o login pessoal" >&2; exit 1; }
          PEDIR_TIMEOUT=${PEDIR_TIMEOUT:-180} termux_env "$TH/.local/bin/agy" --settings "$GP" --mode "$AM" "${GM[@]}" -p "$PROMPT" --output-format json) \
-          > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$?
+          > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
       kill "$VIGIA" 2>/dev/null || true
-      wait "$VIGIA" 2>/dev/null || true ;;
+      wait "$VIGIA" 2>/dev/null || true; VIGIA="" ;;
     claude)
       local PM=plan; [ $MODO = escrita ] && PM=acceptEdits
       if [ $NO_UBUNTU = 1 ]; then
-        (cd /root && timeout -k 10 "${PEDIR_TIMEOUT:-600}" /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$?
+        (cd /root && timeout -k 10 "${PEDIR_TIMEOUT:-600}" /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
       else
-        timeout -k 10 "${PEDIR_TIMEOUT:-600}" proot-distro login ubuntu -- /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT" > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$?
+        timeout -k 10 "${PEDIR_TIMEOUT:-600}" proot-distro login ubuntu -- /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT" > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
       fi ;;
   esac; fi
   SEG=$SECONDS
@@ -207,6 +219,8 @@ if falhou and re.search(r"\b503\b|unavailable|high demand|service unavailable|mo
     estado = "indisponivel"
 elif falhou and re.search(r"rate.?limit|quota.{0,60}(?:exceed|exhaust|limit)|usage limit|limit reached|\b429\b|resource_exhausted|too many requests", texto):
     estado = "limite_pesquisa" if dest == "gemini" and re.search(r"WebSearchToolInvocation|google_web_search|web_search|search_web|grounding|Google Search", err, re.I) else "limite"
+elif falhou and re.search(r"stream was interrupted|connection reset|ECONNRESET|socket hang up", out + err, re.I):
+    estado = "interrompido"
 elif falhou and rc in (124, 137):
     estado = "tempo"; err += "\n[pedir] tempo esgotado (PEDIR_TIMEOUT)"
 elif falhou:
@@ -248,17 +262,17 @@ else:
     print(c(f"── {emo} {nome} falhou ({estado}, código {rc}) ──"), file=sys.stderr)
     print("\n".join((err or out).strip().splitlines()[-5:]), file=sys.stderr)
     print(f"[pedir] {dest} · {stats} · {estado}", file=sys.stderr)
-sys.exit({"ok": 0, "limite": 3, "indisponivel": 4, "limite_pesquisa": 5}.get(estado, 1))
+sys.exit({"ok": 0, "limite": 3, "indisponivel": 4, "limite_pesquisa": 5, "interrompido": 6}.get(estado, 1))
 PY
   RC=$?
-  rm -rf "$TMP"
+  rm -rf "$TMP"; CUR_TMP=""
   return $RC
 }
 
 # Braçadeira antecipada: agente acima do limiar de uso (via 'saldo', 0 tokens) é saltado se houver substituto
 quase_sem() {
   local L=${PEDIR_LIMIAR:-90}
-  "$TH/shared/bin/saldo" "$1" --json --cache-min 30 2>/dev/null | python3 -c "
+  timeout -k 5 90 "$TH/shared/bin/saldo" "$1" --json --cache-min 30 2>/dev/null | python3 -c "
 import sys, json
 d = json.load(sys.stdin).get('$1', {})
 s, w = d.get('sessao_pct') or 0, d.get('semana_pct') or 0
@@ -266,9 +280,18 @@ print(f'{s:.0f}% sessão / {w:.0f}% semana')
 sys.exit(0 if (s >= $L or w >= 98) else 1)"
 }
 
-ANTERIOR=""; RESTAM=$(echo $ORDEM | wc -w)
+# Há, depois de $1 na ordem, algum agente fora do banco?
+ha_substituto() {
+  local depois=0 a
+  for a in $ORDEM; do
+    [ $depois = 1 ] && estado_py disponivel "$a" && return 0
+    [ "$a" = "$1" ] && depois=1
+  done
+  return 1
+}
+
+ANTERIOR=""
 for AG in $ORDEM; do
-  RESTAM=$((RESTAM - 1))
   if [ "$AG" = gemini ] && [[ "$TIPO" = pesquisa || "$TIPO" = documento ]] && ! estado_py disponivel gemini-pesquisa; then
     echo "[pedir] pesquisa Google do Gemini sem quota — salto (leitura local continua disponível)" >&2
     ANTERIOR=$AG; continue
@@ -276,15 +299,20 @@ for AG in $ORDEM; do
   if ! estado_py disponivel "$AG"; then
     echo "[pedir] $AG está no banco (limite atingido) — salto" >&2; ANTERIOR=$AG; continue
   fi
-  if [ $SUBST = 1 ] && [ $RESTAM -gt 0 ] && USO=$(quase_sem "$AG"); then
+  if [ $SUBST = 1 ] && ha_substituto "$AG" && USO=$(quase_sem "$AG"); then
     echo "[pedir] 🔁 $AG quase sem tokens ($USO) — braçadeira antecipada" >&2; ANTERIOR=$AG; continue
   fi
   [ -n "$ANTERIOR" ] && echo "[pedir] 🔁 braçadeira passa de $ANTERIOR para $AG" >&2
   correr "$AG" "$ANTERIOR"; RC=$?
+  if [ $RC = 6 ] && [ "$MODO" = leitura ]; then   # falha de rede passageira: repetir uma vez o mesmo agente
+    echo "[pedir] ↻ ligação do $AG interrompida — nova tentativa" >&2
+    correr "$AG" "$ANTERIOR"; RC=$?
+  fi
   [ $RC = 0 ] && exit 0
   if [ $RC = 3 ]; then
     estado_py banco "$AG" "$(banco_horas "$AG")"
     echo "[pedir] ⛔ $AG sem tokens → no banco ~$(banco_horas "$AG") h" >&2
+    [ "$MODO" = escrita ] && { echo "[pedir] modo escrita: não substituo (o $AG pode ter alterado ficheiros a meio) — rever e repetir" >&2; exit 1; }
   elif [ $RC = 5 ]; then
     estado_py banco gemini-pesquisa 0.25
     echo "[pedir] quota da pesquisa Google esgotada → pesquisa no banco ~15 min; Gemini local disponível" >&2

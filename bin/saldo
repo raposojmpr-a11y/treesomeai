@@ -18,13 +18,15 @@ NO_UBUNTU = os.environ.get("container") == "proot-distro"
 def agora(): return datetime.datetime.now(datetime.timezone.utc)
 
 def claude():
-    def tm(*a): return subprocess.run([TMUX, *SOCK, *a], capture_output=True, text=True).stdout
+    def tm(*a):
+        try: return subprocess.run([TMUX, *SOCK, *a], capture_output=True, text=True, timeout=10).stdout
+        except subprocess.TimeoutExpired: return ""
     def ecra(): return tm("capture-pane", "-p", "-t", "p")
     inner = "cd /root/.cache/saldo-probe && /root/.local/bin/claude"
     cmd = (f"env HOME=/root TERM=xterm-256color bash -c '{inner}'" if NO_UBUNTU
            else f"proot-distro login ubuntu -- env HOME=/root TERM=xterm-256color bash -c 'mkdir -p /root/.cache/saldo-probe; {inner}'")
     if NO_UBUNTU: os.makedirs("/root/.cache/saldo-probe", exist_ok=True)
-    subprocess.run([TMUX, *SOCK, "kill-server"], capture_output=True)
+    tm("kill-server")
     tm("new-session", "-d", "-x", "120", "-y", "45", "-s", "p", cmd)
     try:
         for _ in range(40):                       # espera pela interface
@@ -40,7 +42,7 @@ def claude():
             if "Current week" in s and s.count("% used") >= 2: break
         tm("send-keys", "-t", "p", "Escape")
     finally:
-        subprocess.run([TMUX, *SOCK, "kill-server"], capture_output=True)
+        tm("kill-server")
     def bloco(titulo):
         m = re.search(re.escape(titulo) + r".*?(\d+)% used\s*\n\s*Resets ([^\n]+)", s, re.S)
         return (int(m.group(1)), m.group(2).strip()) if m else (None, None)

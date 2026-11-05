@@ -16,6 +16,8 @@ assert 'write_file(*)' in settings['permissions']['deny']
 assert sys.argv[sys.argv.index('--mode')+1] == 'plan'
 case = os.environ['CASO_TESTE']
 if case == 'timeout': time.sleep(10)
+elif case == 'sinal':
+ open(os.environ['PID_FILE'],'w').write(str(os.getpid())); time.sleep(30)
 elif case == '503': print(json.dumps({'error': {'code':503,'message':'UNAVAILABLE key=AIzaFAKE_TEST_ONLY'}}))
 elif case == 'search_quota':
  print('Error 429 RESOURCE_EXHAUSTED at WebSearchToolInvocation.execute',file=sys.stderr)
@@ -23,6 +25,8 @@ elif case == 'search_quota':
 elif case == 'final_stderr':
  print('Attempt 1 failed: 503 UNAVAILABLE',file=sys.stderr)
  print(json.dumps({'error':{'code':429,'message':'You have exhausted your daily quota on this model.'}}),file=sys.stderr)
+elif case == 'stream':
+ print('"The stream was interrupted. Please continue the task you were working on."',file=sys.stderr)
 elif case == '429': print(json.dumps({'error': {'code':429,'message':'quota exhausted'}}))
 elif case == 'status_error': print(json.dumps({'status':'WAITING','response':'partial'}))
 elif case == 'error_response': print(json.dumps({'response':'partial','stats':{'models':{'test':{'tokens':{'prompt':14290}}}},'error':{'message':'context length exceeded'}}))
@@ -35,7 +39,7 @@ else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'
     content = content.replace('ESTADO=$TH/shared/estado-contas.json', f'ESTADO={base}/estado.json')
     content = content.replace('termux_env "$TH/.local/bin/agy" ', f'termux_env {fake} ')
     script.write_text(content); script.chmod(0o700)
-    for case, expected, bank in [('ok','ok',False),('503','indisponivel',True),('429','limite',True),('final_stderr','limite',True),('search_quota','limite_pesquisa',False),('error_response','erro',False),('status_error','erro',False),('timeout','tempo',False)]:
+    for case, expected, bank in [('ok','ok',False),('503','indisponivel',True),('429','limite',True),('final_stderr','limite',True),('search_quota','limite_pesquisa',False),('error_response','erro',False),('status_error','erro',False),('timeout','tempo',False),('stream','interrompido',False)]:
         (base/'estado.json').write_text('{}')
         env = dict(os.environ, CASO_TESTE=case, PEDIR_ORIGEM='codex', PEDIR_TIMEOUT='1')
         proc = subprocess.run([str(script),'gemini','-n','teste offline'],env=env,text=True,capture_output=True,timeout=15)
@@ -44,6 +48,8 @@ else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'
         assert (proc.returncode == 0) == (expected == 'ok'), (case, proc.returncode)
         state = json.loads((base/'estado.json').read_text())
         assert bool(state.get('gemini')) == bank, (case,state)
+        if case == 'stream':
+            assert proc.stderr.count('nova tentativa') == 1 and len(rows) >= 2 and rows[-2]['estado'] == 'interrompido', proc.stderr
         if case == 'ok':
             assert [rows[-1][k] for k in ('tok_entrada','tok_saida','tok_cache')] == ['100','10','20']
         if case == 'search_quota':
@@ -58,4 +64,23 @@ else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'
             diag = (base/'diagnosticos/gemini-ultimo-erro.txt').read_text()
             assert 'AIza' not in diag and 'AIza' not in proc.stderr
         print(f'{case}: OK')
-print('8 regressões offline passaram; nenhuma chamada a agentes.')
+    # SIGTERM ao pedir: termina o agente, sai com 130 e não deixa temporários
+    import signal, time, glob
+    pidf = base/'agente.pid'
+    antes = set(glob.glob('/data/data/com.termux/files/usr/tmp/pedir.*'))
+    env = dict(os.environ, CASO_TESTE='sinal', PEDIR_ORIGEM='codex', PEDIR_TIMEOUT='60', PID_FILE=str(pidf))
+    proc = subprocess.Popen([str(script),'gemini','-n','teste offline'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    for _ in range(50):
+        if pidf.exists() and pidf.read_text(): break
+        time.sleep(0.1)
+    agente = int(pidf.read_text())
+    proc.send_signal(signal.SIGTERM)
+    rc = proc.wait(timeout=10)
+    time.sleep(0.5)
+    assert rc == 130, (rc, proc.stderr.read())
+    try: os.kill(agente, 0); vivo = True
+    except ProcessLookupError: vivo = False
+    assert not vivo, 'agente ficou órfão'
+    assert set(glob.glob('/data/data/com.termux/files/usr/tmp/pedir.*')) <= antes, 'temporários ficaram'
+    print('sinal: OK')
+print('10 regressões offline passaram; nenhuma chamada a agentes.')
