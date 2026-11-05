@@ -6,7 +6,7 @@ Uso: saldo [claude|codex|gemini ...] [--json] [--cache-min N]
   Gemini: ainda sem medição (plano gratuito diário).
 Grava o resultado em ~/shared/saldo.json — o 'pedir' usa-o para passar a braçadeira ANTES do limite.
 """
-import glob, json, os, re, subprocess, sys, time, datetime
+import fcntl, glob, json, os, re, subprocess, sys, time, datetime
 
 TH = "/data/data/com.termux/files/home"
 TP = "/data/data/com.termux/files/usr"
@@ -51,24 +51,25 @@ def claude():
 def codex():
     fs = glob.glob(f"{TH}/.codex/sessions/**/*.jsonl", recursive=True)
     if not fs: return {"erro": "sem sessões do Codex"}
-    f = max(fs, key=os.path.getmtime)
+    def find(o):
+        if isinstance(o, dict):
+            if "rate_limits" in o and isinstance(o["rate_limits"], dict): return o["rate_limits"]
+            for v in o.values():
+                r = find(v)
+                if r: return r
+        elif isinstance(o, list):
+            for v in o:
+                r = find(v)
+                if r: return r
+    # A sessão mais recente pode estar a decorrer e ainda sem rate_limits: recuar até 20 sessões.
     rl = None
-    for line in open(f, errors="replace"):
-        if '"rate_limits"' not in line: continue
-        try:
-            def find(o):
-                if isinstance(o, dict):
-                    if "rate_limits" in o and isinstance(o["rate_limits"], dict): return o["rate_limits"]
-                    for v in o.values():
-                        r = find(v)
-                        if r: return r
-                elif isinstance(o, list):
-                    for v in o:
-                        r = find(v)
-                        if r: return r
-            rl = find(json.loads(line)) or rl
-        except Exception: pass
-    if not rl: return {"erro": "sem rate_limits na última sessão"}
+    for f in sorted(fs, key=os.path.getmtime, reverse=True)[:20]:
+        for line in open(f, errors="replace"):
+            if '"rate_limits"' not in line: continue
+            try: rl = find(json.loads(line)) or rl
+            except Exception: pass
+        if rl: break
+    if not rl: return {"erro": "sem rate_limits nas últimas 20 sessões"}
     def janela(k):
         j = rl.get(k) or {}
         pct, ra = j.get("used_percent"), j.get("resets_at")
@@ -89,15 +90,24 @@ def main():
     cache_min = 0
     if "--cache-min" in sys.argv:
         cache_min = float(sys.argv[sys.argv.index("--cache-min") + 1]); quais = [a for a in quais if not a.replace(".", "").isdigit()]
-    try: dados = json.load(open(CACHE))
-    except Exception: dados = {}
-    for a in quais:
-        e = dados.get(a, {})
-        fresco = e.get("medido_em") and (agora() - datetime.datetime.fromisoformat(e["medido_em"])).total_seconds() < cache_min * 60
-        if not fresco:
-            r = {"claude": claude, "codex": codex, "gemini": gemini}[a]()
-            r["medido_em"] = agora().isoformat(timespec="seconds"); dados[a] = r
-    with open(CACHE, "w") as f: json.dump(dados, f, indent=1)
+    quais = [a for a in quais if a in ("claude", "codex", "gemini")] or ["claude", "codex", "gemini"]
+    # Lock exclusivo: duas medições em paralelo matariam o mesmo servidor tmux e perderiam escritas no cache.
+    # Quem espera relê o cache já atualizado por quem mediu primeiro.
+    with open(CACHE + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try: dados = json.load(open(CACHE))
+        except Exception: dados = {}
+        for a in quais:
+            e = dados.get(a, {})
+            try: fresco = bool(e.get("medido_em")) and (agora() - datetime.datetime.fromisoformat(e["medido_em"])).total_seconds() < cache_min * 60
+            except (ValueError, TypeError): fresco = False
+            if not fresco:
+                try: r = {"claude": claude, "codex": codex, "gemini": gemini}[a]()
+                except Exception as ex: r = {"erro": f"falha na medição: {ex}"}
+                r["medido_em"] = agora().isoformat(timespec="seconds"); dados[a] = r
+        tmp = CACHE + ".tmp"
+        with open(tmp, "w") as f: json.dump(dados, f, indent=1)
+        os.replace(tmp, CACHE)                     # escrita atómica: quem lê nunca apanha JSON a meio
     if "--json" in sys.argv:
         print(json.dumps({a: dados[a] for a in quais}, ensure_ascii=False)); return
     ID = {"claude": "🟠 Claude", "codex": "🟢 Codex ", "gemini": "🔵 Gemini"}

@@ -44,7 +44,8 @@ raizes = ["/root/.claude/projects",
           "/data/data/com.termux/files/usr/var/lib/proot-distro/containers/ubuntu/rootfs/root/.claude/projects"]
 fich = []
 for r in raizes:
-    if os.path.isdir(r): fich = glob.glob(f"{r}/*/*.jsonl"); break
+    fich = glob.glob(f"{r}/*/*.jsonl")
+    if fich: break
 vistos, tot, sess = set(), defaultdict(int), set()
 for p in fich:
     try:
