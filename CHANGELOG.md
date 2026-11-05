@@ -3,6 +3,8 @@ Formato: [Keep a Changelog](https://keepachangelog.com/pt-PT/1.1.0/). Datas AAAA
 Regra: cada alteração ao código entra aqui, no mesmo commit.
 
 ## [Por lançar]
+### Adicionado
+- README: secção "O que faz"; repositório publicado no GitHub. (claude)
 
 ## [0.1.0] — 2026-11-05
 ### Adicionado
