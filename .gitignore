@@ -1,0 +1,11 @@
+# TreeSomeAI — só código e documentação do projeto; estado, registos e dados pessoais ficam fora
+*
+!.gitignore
+!README.md
+!bin/
+!bin/**
+!tests/
+!tests/**
+!policies/
+!policies/**
+__pycache__/

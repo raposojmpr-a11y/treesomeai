@@ -1,0 +1,112 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""saldo — quanto resta das contas dos agentes, sem gastar tokens.
+Uso: saldo [claude|codex|gemini ...] [--json] [--cache-min N]
+  Claude: abre o Claude Code numa sessão tmux escondida e lê o ecrã /usage (comando local, 0 tokens, ~15 s).
+  Codex:  lê os rate_limits gravados pelo próprio Codex na última sessão (instantâneo; vale à data dessa chamada).
+  Gemini: ainda sem medição (plano gratuito diário).
+Grava o resultado em ~/shared/saldo.json — o 'pedir' usa-o para passar a braçadeira ANTES do limite.
+"""
+import glob, json, os, re, subprocess, sys, time, datetime
+
+TH = "/data/data/com.termux/files/home"
+TP = "/data/data/com.termux/files/usr"
+CACHE = f"{TH}/shared/saldo.json"
+TMUX = f"{TP}/bin/tmux"
+SOCK = ["-L", "saldo-probe"]
+NO_UBUNTU = os.environ.get("container") == "proot-distro"
+
+def agora(): return datetime.datetime.now(datetime.timezone.utc)
+
+def claude():
+    def tm(*a): return subprocess.run([TMUX, *SOCK, *a], capture_output=True, text=True).stdout
+    def ecra(): return tm("capture-pane", "-p", "-t", "p")
+    inner = "cd /root/.cache/saldo-probe && /root/.local/bin/claude"
+    cmd = (f"env HOME=/root TERM=xterm-256color bash -c '{inner}'" if NO_UBUNTU
+           else f"proot-distro login ubuntu -- env HOME=/root TERM=xterm-256color bash -c 'mkdir -p /root/.cache/saldo-probe; {inner}'")
+    if NO_UBUNTU: os.makedirs("/root/.cache/saldo-probe", exist_ok=True)
+    subprocess.run([TMUX, *SOCK, "kill-server"], capture_output=True)
+    tm("new-session", "-d", "-x", "120", "-y", "45", "-s", "p", cmd)
+    try:
+        for _ in range(40):                       # espera pela interface
+            time.sleep(0.5); s = ecra()
+            if "trust this folder" in s:           # pasta vazia dedicada: aceitar uma vez
+                tm("send-keys", "-t", "p", "Down"); time.sleep(0.4); tm("send-keys", "-t", "p", "Enter"); time.sleep(3)
+            elif "shortcuts" in s or "❯" in s or "> " in s: break
+        time.sleep(1.5)
+        tm("send-keys", "-t", "p", "/usage"); time.sleep(1); tm("send-keys", "-t", "p", "Enter")
+        s = ""
+        for _ in range(30):
+            time.sleep(0.5); s = ecra()
+            if "Current week" in s and s.count("% used") >= 2: break
+        tm("send-keys", "-t", "p", "Escape")
+    finally:
+        subprocess.run([TMUX, *SOCK, "kill-server"], capture_output=True)
+    def bloco(titulo):
+        m = re.search(re.escape(titulo) + r".*?(\d+)% used\s*\n\s*Resets ([^\n]+)", s, re.S)
+        return (int(m.group(1)), m.group(2).strip()) if m else (None, None)
+    sp, sr = bloco("Current session"); wp, wr = bloco("Current week")
+    if sp is None: return {"erro": "não consegui ler o ecrã /usage"}
+    return {"sessao_pct": sp, "sessao_renova": sr, "semana_pct": wp, "semana_renova": wr, "fonte": "/usage"}
+
+def codex():
+    fs = glob.glob(f"{TH}/.codex/sessions/**/*.jsonl", recursive=True)
+    if not fs: return {"erro": "sem sessões do Codex"}
+    f = max(fs, key=os.path.getmtime)
+    rl = None
+    for line in open(f, errors="replace"):
+        if '"rate_limits"' not in line: continue
+        try:
+            def find(o):
+                if isinstance(o, dict):
+                    if "rate_limits" in o and isinstance(o["rate_limits"], dict): return o["rate_limits"]
+                    for v in o.values():
+                        r = find(v)
+                        if r: return r
+                elif isinstance(o, list):
+                    for v in o:
+                        r = find(v)
+                        if r: return r
+            rl = find(json.loads(line)) or rl
+        except Exception: pass
+    if not rl: return {"erro": "sem rate_limits na última sessão"}
+    def janela(k):
+        j = rl.get(k) or {}
+        pct, ra = j.get("used_percent"), j.get("resets_at")
+        if ra and ra < time.time(): pct = 0.0          # janela já renovou desde a última chamada
+        return pct, (datetime.datetime.fromtimestamp(ra).strftime("%d/%m %H:%M") if ra else None)
+    sp, sr = janela("primary"); wp, wr = janela("secondary")
+    medido = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime("%d/%m %H:%M")
+    return {"sessao_pct": sp, "sessao_renova": sr, "semana_pct": wp, "semana_renova": wr,
+            "fonte": f"última chamada ({medido})"}
+
+def gemini():
+    return {"erro": "sem medição (plano gratuito; ainda sem chave de API)" if not os.path.exists(f"{TH}/.gemini/.env")
+            else "sem medição automática (plano gratuito diário)"}
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    quais = args or ["claude", "codex", "gemini"]
+    cache_min = 0
+    if "--cache-min" in sys.argv:
+        cache_min = float(sys.argv[sys.argv.index("--cache-min") + 1]); quais = [a for a in quais if not a.replace(".", "").isdigit()]
+    try: dados = json.load(open(CACHE))
+    except Exception: dados = {}
+    for a in quais:
+        e = dados.get(a, {})
+        fresco = e.get("medido_em") and (agora() - datetime.datetime.fromisoformat(e["medido_em"])).total_seconds() < cache_min * 60
+        if not fresco:
+            r = {"claude": claude, "codex": codex, "gemini": gemini}[a]()
+            r["medido_em"] = agora().isoformat(timespec="seconds"); dados[a] = r
+    with open(CACHE, "w") as f: json.dump(dados, f, indent=1)
+    if "--json" in sys.argv:
+        print(json.dumps({a: dados[a] for a in quais}, ensure_ascii=False)); return
+    ID = {"claude": "🟠 Claude", "codex": "🟢 Codex ", "gemini": "🔵 Gemini"}
+    for a in quais:
+        r = dados[a]
+        if "erro" in r: print(f"{ID[a]}  —  {r['erro']}"); continue
+        def barra(p): p = p or 0; n = int(round(p / 10)); return "█" * n + "░" * (10 - n)
+        aviso = " ⚠️" if (r.get("sessao_pct") or 0) >= 80 or (r.get("semana_pct") or 0) >= 80 else ""
+        print(f"{ID[a]}  sessão {barra(r['sessao_pct'])} {r['sessao_pct']:>5.0f}% (renova {r['sessao_renova']})"
+              f" · semana {r['semana_pct']:>3.0f}% (renova {r['semana_renova']}){aviso}   [{r['fonte']}]")
+
+main()

@@ -1,0 +1,302 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# pedir — forma única de um agente chamar outro, com registo de consumo e "braçadeira" (substituição automática)
+# Uso: pedir <codex|gemini|claude|auto> [-t tipo] [-w] [-n] "pedido"
+#      agy e antigravity são aliases de gemini (Antigravity via Gemini API)
+#      pedir --estado            mostra que agentes estão "no banco" (limite atingido)
+#      pedir --livre <agente>    tira um agente do banco manualmente
+#   -t tipo : pesquisa|termux|rede|codigo|revisao|documento|outro (omissão: outro)
+#   -w      : permitir escrita (por omissão: só leitura)
+#   -n      : sem substituição (se o agente falhar, não passa a outro)
+#   auto    : escolhe o titular pela cadeia do tipo de tarefa
+#   PEDIR_ORIGEM=<agente> identifica quem chama (omissão: claude no Ubuntu, termux no Termux)
+set -uo pipefail
+TH=/data/data/com.termux/files/home
+TP=/data/data/com.termux/files/usr
+LOG=$TH/shared/consumo.csv
+ESTADO=$TH/shared/estado-contas.json
+
+# Cadeias de capitania por tipo de tarefa (titular primeiro). Ajustadas nas revisões de consumo.
+cadeia() {
+  case $1 in
+    pesquisa|documento) echo "gemini claude codex" ;;
+    termux|rede|codigo) echo "codex claude gemini" ;;
+    revisao)            echo "codex gemini claude" ;;
+    *)                  echo "claude codex gemini" ;;
+  esac
+}
+# Horas "no banco" após bater no limite (estimativas: janelas de ~5 h do Claude Pro e do ChatGPT; Gemini gratuito diário)
+banco_horas() { case $1 in claude) echo 5 ;; codex) echo 5 ;; gemini) echo 12 ;; esac; }
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+# --- Estado das contas (quem está no banco) ---
+estado_py() { python3 - "$ESTADO" "$@" <<'PY'
+import sys, json, os, fcntl, datetime
+path, acao = sys.argv[1], sys.argv[2]
+agora = datetime.datetime.now()
+open(path, "a").close()
+with open(path, "r+") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try: d = json.loads(f.read() or "{}")
+    except Exception: d = {}
+    if acao == "banco":            # banco <agente> <horas>
+        ag, h = sys.argv[3], float(sys.argv[4])
+        d[ag] = {"limite_ate": (agora + datetime.timedelta(hours=h)).isoformat(timespec="minutes"),
+                 "desde": agora.isoformat(timespec="minutes")}
+    elif acao == "livre":
+        d.pop(sys.argv[3], None)
+    elif acao == "disponivel":     # código 0 = disponível
+        e = d.get(sys.argv[3])
+        sys.exit(0 if not e or datetime.datetime.fromisoformat(e["limite_ate"]) <= agora else 1)
+    elif acao == "mostrar":
+        ativos = {k: v for k, v in d.items() if datetime.datetime.fromisoformat(v["limite_ate"]) > agora}
+        if not ativos: print("Todos os agentes disponíveis.")
+        for k, v in ativos.items(): print(f"{k}: no banco desde {v['desde']} até ~{v['limite_ate']}")
+    f.seek(0); f.truncate(); f.write(json.dumps(d, indent=1))
+PY
+}
+
+case ${1:-} in
+  --estado) estado_py mostrar; exit 0 ;;
+  --livre)  [ $# -ge 2 ] || usage; estado_py livre "$2"; echo "$2 de volta ao jogo."; exit 0 ;;
+esac
+
+[ $# -ge 1 ] || usage
+DEST=$1; shift
+case $DEST in agy|antigravity) DEST=gemini ;; esac
+case $DEST in codex|gemini|claude|auto) ;; *) usage ;; esac
+TIPO=outro; MODO=leitura; SUBST=1
+while getopts "t:wnh" o; do case $o in t) TIPO=$OPTARG ;; w) MODO=escrita ;; n) SUBST=0 ;; *) usage ;; esac; done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage
+PEDIDO="$*"
+
+NO_UBUNTU=0; [ "${container:-}" = proot-distro ] && NO_UBUNTU=1
+ORIGEM=${PEDIR_ORIGEM:-$([ $NO_UBUNTU = 1 ] && echo claude || echo termux)}
+
+# Ordem de tentativa: destino pedido primeiro, depois o resto da cadeia; nunca a própria origem
+ORDEM=""
+[ "$DEST" != auto ] && ORDEM=$DEST
+[ "$DEST" = auto ] || [ $SUBST = 1 ] && for a in $(cadeia "$TIPO"); do case " $ORDEM " in *" $a "*) ;; *) ORDEM="$ORDEM $a" ;; esac; done
+ORDEM=$(for a in $ORDEM; do [ "$a" != "$ORIGEM" ] && echo -n "$a "; done)
+[ -n "$ORDEM" ] || { echo "[pedir] nenhum agente disponível para chamar" >&2; exit 2; }
+
+termux_env() { timeout -k 10 "${PEDIR_TIMEOUT:-600}" env HOME=$TH PREFIX=$TP TMPDIR=$TP/tmp TERMUX_VERSION=${TERMUX_VERSION:-0.118.3} PATH=$TP/bin:/usr/bin:/bin "$@"; }
+
+# Corre um agente. Código: 0 ok · 3 limite · 4 indisponível · 5 quota pesquisa · 1 erro
+correr() {
+  local AG=$1 ANTERIOR=$2 TMP RC SEG PROMPT NOTA=""
+  [ -n "$ANTERIOR" ] && NOTA="
+[Braçadeira: substituis o $ANTERIOR, que está sem tokens/indisponível. Se a tarefa for longa, regista o progresso em ~/shared/temas/ para quem continuar.]"
+  PROMPT="[Pedido de $ORIGEM via 'pedir' | tipo: $TIPO | modo: $MODO]$NOTA
+Faz só o que é pedido. Resposta concisa: sem repetir o enunciado, sem introduções nem resumos finais. Lê da memória partilhada só o tema necessário.$([ $MODO = leitura ] && echo ' Não alteres ficheiros.')
+
+$PEDIDO"
+  TMP=$(mktemp -d "$TP/tmp/pedir.XXXXXX") || return 1
+  SECONDS=0
+  if [ -n "${PEDIR_SIMULAR_LIMITE:-}" ] && [ "$AG" = "$PEDIR_SIMULAR_LIMITE" ]; then
+    echo "simulated rate limit reached" > "$TMP/err"; : > "$TMP/out"; RC=1   # só para testes
+  else case $AG in
+    codex)
+      local SB=read-only; [ $MODO = escrita ] && SB=workspace-write
+      (cd "$TH" && termux_env codex exec --json --skip-git-repo-check --sandbox $SB \
+          -o "$TMP/resp.txt" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$? ;;
+    gemini)
+      local AM=plan
+      [ "$MODO" = escrita ] && AM=accept-edits
+      local -a GM=(--model "${PEDIR_GEMINI_MODEL:-gemini-3.6-flash-medium}")
+      local GP="$TH/shared/policies/antigravity-$MODO.json"
+      echo "[pedir] Antigravity via Gemini API a trabalhar (limite ${PEDIR_TIMEOUT:-180}s)…" >&2
+      python3 -u -c 'import time
+n = 0
+while True:
+    time.sleep(20)
+    n += 20
+    print(f"[pedir] Antigravity ainda a trabalhar ({n}s)…", flush=True)' >&2 &
+      local VIGIA=$!
+      # Só API: --settings força modelProvider=gemini por chamada; nunca usa o login pessoal.
+      (cd "$TH/shared" || exit 1
+         set -a
+         if [ -f "$TH/.gemini/.env" ]; then . "$TH/.gemini/.env" || exit 1; fi
+         set +a
+         [ -n "${GEMINI_API_KEY:-}" ] || { echo "[pedir] falta GEMINI_API_KEY; não uso o login pessoal" >&2; exit 1; }
+         PEDIR_TIMEOUT=${PEDIR_TIMEOUT:-180} termux_env "$TH/.local/bin/agy" --settings "$GP" --mode "$AM" "${GM[@]}" -p "$PROMPT" --output-format json) \
+          > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$?
+      kill "$VIGIA" 2>/dev/null || true
+      wait "$VIGIA" 2>/dev/null || true ;;
+    claude)
+      local PM=plan; [ $MODO = escrita ] && PM=acceptEdits
+      if [ $NO_UBUNTU = 1 ]; then
+        (cd /root && timeout -k 10 "${PEDIR_TIMEOUT:-600}" /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$?
+      else
+        timeout -k 10 "${PEDIR_TIMEOUT:-600}" proot-distro login ubuntu -- /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT" > "$TMP/out" 2> "$TMP/err" < /dev/null; RC=$?
+      fi ;;
+  esac; fi
+  SEG=$SECONDS
+  python3 - "$AG" "$TMP" "$RC" "$SEG" "$LOG" "$ORIGEM" "$TIPO" "$MODO" "$PEDIDO" "${ANTERIOR:--}" <<'PY'
+import sys, json, os, csv, re, datetime, fcntl
+dest, tmp, rc, seg, log, origem, tipo, modo, pedido, anterior = sys.argv[1:11]
+rc = int(rc)
+out = open(f"{tmp}/out", errors="replace").read()
+err = open(f"{tmp}/err", errors="replace").read()
+resp, tin, tout, tcache = "", 0, 0, 0
+api_error = None
+try:
+    if dest == "codex":
+        if os.path.exists(f"{tmp}/resp.txt"):
+            resp = open(f"{tmp}/resp.txt", errors="replace").read()
+        for line in out.splitlines():
+            try: ev = json.loads(line)
+            except Exception: continue
+            u = ev.get("usage") if isinstance(ev, dict) else None
+            if isinstance(u, dict):
+                tin += u.get("input_tokens", 0); tout += u.get("output_tokens", 0)
+                tcache += u.get("cached_input_tokens", 0)
+            if not resp and ev.get("type") == "item.completed":
+                it = ev.get("item", {})
+                if it.get("type") == "agent_message": resp = it.get("text", "")
+    elif dest == "gemini":
+        d = {}
+        for i in [k for k in range(len(out)) if out.startswith("{", k) and (k == 0 or out[k-1] == "\n")]:
+            try: d = json.loads(out[i:]); break      # 1.º bloco JSON completo (ignora avisos antes)
+            except Exception: pass
+        resp = d.get("response", "") or ""
+        api_error = d.get("error")
+        if d.get("status") and d["status"] != "SUCCESS":
+            api_error = api_error or {"message": "Antigravity terminou com estado " + str(d["status"])}
+        u = d.get("usage", {}) or {}
+        tin = u.get("input_tokens", 0)
+        tout = u.get("output_tokens", 0)  # já inclui thinking_tokens no envelope agy
+        tcache = u.get("cache_read_tokens", 0)
+        if api_error: err += "\n" + json.dumps(api_error, ensure_ascii=False)
+        if "usage" not in d:  # compatibilidade apenas com envelopes antigos
+            for m in (d.get("stats", {}).get("models", {}) or {}).values():
+                t = m.get("tokens", {})
+                tin += t.get("prompt", 0); tout += t.get("candidates", 0) + t.get("thoughts", 0)
+                tcache += t.get("cached", 0)
+    else:
+        d = json.loads(out[out.find("{"):]) if "{" in out else {}
+        resp = d.get("result", "") or ""
+        u = d.get("usage", {}) or {}
+        tcache = u.get("cache_read_input_tokens", 0)
+        tin = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + tcache
+        tout = u.get("output_tokens", 0)
+except Exception as e:
+    err += f"\n[pedir] erro a interpretar a saída: {e}"
+# O CLI pode enviar o erro JSON final para stderr, após mensagens de repetição.
+if dest == "gemini" and not api_error:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"(?m)^\s*\{", err):
+        try:
+            candidate, _ = decoder.raw_decode(err[match.start():].lstrip())
+            if isinstance(candidate, dict):
+                final_error = candidate.get("error")
+                if not final_error and "message" in candidate and "code" in candidate:
+                    final_error = candidate
+                if final_error: api_error = final_error
+        except (ValueError, TypeError):
+            pass
+# Não mostrar chaves caso uma mensagem de erro inclua o URL do pedido.
+err = re.sub(r"AIza[\w-]+", "[CHAVE OCULTA]", err)
+err = re.sub(r"(?i)([?&]key=)[^&\s\"]+", r"\1[OCULTA]", err)
+out = re.sub(r"AIza[\w-]+", "[CHAVE OCULTA]", out)
+texto = (json.dumps(api_error) if dest == "gemini" and api_error else err if dest == "gemini" else out + err).lower()
+falhou = rc != 0 or bool(api_error) or not resp.strip()
+if falhou and re.search(r"\b503\b|unavailable|high demand|service unavailable|model.*overloaded", texto):
+    estado = "indisponivel"
+elif falhou and re.search(r"rate.?limit|quota.{0,60}(?:exceed|exhaust|limit)|usage limit|limit reached|\b429\b|resource_exhausted|too many requests", texto):
+    estado = "limite_pesquisa" if dest == "gemini" and re.search(r"WebSearchToolInvocation|google_web_search|web_search|search_web|grounding|Google Search", err, re.I) else "limite"
+elif falhou and rc in (124, 137):
+    estado = "tempo"; err += "\n[pedir] tempo esgotado (PEDIR_TIMEOUT)"
+elif falhou:
+    estado = "erro"
+else:
+    estado = "ok"
+try:
+    with open(log, "a", newline="") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        w = csv.writer(f)
+        if f.tell() == 0:
+            w.writerow(["data","origem","destino","tipo","modo","tok_entrada","tok_saida","tok_cache","segundos","estado","resumo","substituiu"])
+        resumo = re.sub(r"\s+", " ", pedido)[:80]
+        w.writerow([datetime.datetime.now().isoformat(timespec="seconds"), origem, dest, tipo, modo, tin, tout, tcache, seg, estado, resumo, anterior])
+except OSError as e:
+    print(f"[pedir] aviso: não consegui registar no CSV ({e})", file=sys.stderr)
+# Identificação gráfica de quem escreve: 🟠 Claude · 🟢 Codex · 🔵 Gemini
+ID = {"claude": ("🟠", "CLAUDE", "38;5;208"), "codex": ("🟢", "CODEX", "32"), "gemini": ("🔵", "ANTIGRAVITY · Gemini API", "34")}
+emo, nome, cor = ID[dest]
+tty = sys.stdout.isatty()
+c = (lambda s: f"\033[1;{cor}m{s}\033[0m") if tty else (lambda s: s)
+sub = f" · substitui {anterior}" if anterior != "-" else ""
+stats = f"{tin} entrada (cache {tcache}) · {tout} saída · {seg}s"
+if estado == "ok":
+    print(c(f"╭── {emo} {nome} responde · {tipo} · {modo}{sub} ──"))
+    print(resp.strip())
+    print(c(f"╰── {emo} fim {nome} · {stats} ──"))
+else:
+    diagdir = os.path.join(os.path.dirname(log), "diagnosticos")
+    try:
+        os.makedirs(diagdir, mode=0o700, exist_ok=True)
+        diagpath = os.path.join(diagdir, f"{dest}-ultimo-erro.txt")
+        fd = os.open(diagpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{datetime.datetime.now().isoformat()} estado={estado} rc={rc} segundos={seg}\n" + (err or "[pedir] sem resposta JSON válida")[-16000:])
+        print(f"[pedir] diagnóstico: {diagpath}", file=sys.stderr)
+    except OSError:
+        pass
+    print(c(f"── {emo} {nome} falhou ({estado}, código {rc}) ──"), file=sys.stderr)
+    print("\n".join((err or out).strip().splitlines()[-5:]), file=sys.stderr)
+    print(f"[pedir] {dest} · {stats} · {estado}", file=sys.stderr)
+sys.exit({"ok": 0, "limite": 3, "indisponivel": 4, "limite_pesquisa": 5}.get(estado, 1))
+PY
+  RC=$?
+  rm -rf "$TMP"
+  return $RC
+}
+
+# Braçadeira antecipada: agente acima do limiar de uso (via 'saldo', 0 tokens) é saltado se houver substituto
+quase_sem() {
+  local L=${PEDIR_LIMIAR:-90}
+  "$TH/shared/bin/saldo" "$1" --json --cache-min 30 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('$1', {})
+s, w = d.get('sessao_pct') or 0, d.get('semana_pct') or 0
+print(f'{s:.0f}% sessão / {w:.0f}% semana')
+sys.exit(0 if (s >= $L or w >= 98) else 1)"
+}
+
+ANTERIOR=""; RESTAM=$(echo $ORDEM | wc -w)
+for AG in $ORDEM; do
+  RESTAM=$((RESTAM - 1))
+  if [ "$AG" = gemini ] && [[ "$TIPO" = pesquisa || "$TIPO" = documento ]] && ! estado_py disponivel gemini-pesquisa; then
+    echo "[pedir] pesquisa Google do Gemini sem quota — salto (leitura local continua disponível)" >&2
+    ANTERIOR=$AG; continue
+  fi
+  if ! estado_py disponivel "$AG"; then
+    echo "[pedir] $AG está no banco (limite atingido) — salto" >&2; ANTERIOR=$AG; continue
+  fi
+  if [ $SUBST = 1 ] && [ $RESTAM -gt 0 ] && USO=$(quase_sem "$AG"); then
+    echo "[pedir] 🔁 $AG quase sem tokens ($USO) — braçadeira antecipada" >&2; ANTERIOR=$AG; continue
+  fi
+  [ -n "$ANTERIOR" ] && echo "[pedir] 🔁 braçadeira passa de $ANTERIOR para $AG" >&2
+  correr "$AG" "$ANTERIOR"; RC=$?
+  [ $RC = 0 ] && exit 0
+  if [ $RC = 3 ]; then
+    estado_py banco "$AG" "$(banco_horas "$AG")"
+    echo "[pedir] ⛔ $AG sem tokens → no banco ~$(banco_horas "$AG") h" >&2
+  elif [ $RC = 5 ]; then
+    estado_py banco gemini-pesquisa 0.25
+    echo "[pedir] quota da pesquisa Google esgotada → pesquisa no banco ~15 min; Gemini local disponível" >&2
+    [ "$MODO" = escrita ] && exit 1
+  elif [ $RC = 4 ]; then
+    estado_py banco "$AG" 0.25
+    echo "[pedir] $AG temporariamente indisponível → banco ~15 min" >&2
+    [ "$MODO" = escrita ] && exit 1
+  elif [ $MODO = escrita ]; then
+    echo "[pedir] $AG deu erro em modo escrita — não substituo (evitar alterações duplicadas)" >&2; exit 1
+  fi
+  [ $SUBST = 1 ] || exit 1
+  ANTERIOR=$AG
+done
+echo "[pedir] ❌ nenhum agente da cadeia conseguiu responder ($ORDEM)" >&2
+exit 1

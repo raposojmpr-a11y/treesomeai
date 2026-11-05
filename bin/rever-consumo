@@ -1,0 +1,79 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""rever-consumo — resumo do consumo de tokens dos agentes.
+Uso: rever-consumo [dias]   (omissão: 7)
+Fontes: ~/shared/consumo.csv (chamadas via 'pedir') + sessões do Claude Code (~/.claude/projects).
+"""
+import csv, glob, json, os, sys, datetime
+from collections import defaultdict
+
+TH = "/data/data/com.termux/files/home"
+LOG = f"{TH}/shared/consumo.csv"
+dias = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+desde = datetime.datetime.now() - datetime.timedelta(days=dias)  # hora local (CSV)
+desde_utc = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=dias)  # sessões Claude (UTC)
+print(f"== Consumo dos últimos {dias} dias (desde {desde:%Y-%m-%d}) ==\n")
+
+# 1) Chamadas entre agentes
+linhas = []
+if os.path.exists(LOG):
+    with open(LOG) as f:
+        for r in csv.DictReader(f):
+            try:
+                if datetime.datetime.fromisoformat(r["data"]) >= desde: linhas.append(r)
+            except Exception: pass
+print(f"-- Chamadas entre agentes (pedir): {len(linhas)}")
+if linhas:
+    g = defaultdict(lambda: [0, 0, 0, 0, 0, 0])  # n, entrada, saida, cache, seg, falhas
+    for r in linhas:
+        for chave in [(r["destino"], "TOTAL"), (r["destino"], r["tipo"])]:
+            a = g[chave]; a[0] += 1
+            a[1] += int(r["tok_entrada"] or 0); a[2] += int(r["tok_saida"] or 0)
+            a[3] += int(r["tok_cache"] or 0); a[4] += int(r["segundos"] or 0)
+            a[5] += r["estado"] != "ok"
+    print(f"{'agente':8} {'tipo':10} {'n':>3} {'entrada':>9} {'saída':>8} {'cache':>8} {'média/ch':>9} {'s/ch':>5} {'falhas':>6}")
+    for (d, t), a in sorted(g.items(), key=lambda x: (x[0][0], x[0][1] != "TOTAL", x[0][1])):
+        n = a[0]
+        print(f"{d:8} {t:10} {n:>3} {a[1]:>9} {a[2]:>8} {a[3]:>8} {(a[1]+a[2])//n:>9} {a[4]//n:>5} {a[5]:>6}")
+    lim = [r for r in linhas if r["estado"] == "limite"]
+    if lim:
+        print(f"\n!! {len(lim)} chamada(s) bateram no limite da conta: " + ", ".join(sorted({r['destino'] for r in lim})))
+print()
+
+# 2) Sessões do Claude Code (uso direto do João + coordenação)
+raizes = ["/root/.claude/projects",
+          "/data/data/com.termux/files/usr/var/lib/proot-distro/containers/ubuntu/rootfs/root/.claude/projects"]
+fich = []
+for r in raizes:
+    if os.path.isdir(r): fich = glob.glob(f"{r}/*/*.jsonl"); break
+vistos, tot, sess = set(), defaultdict(int), set()
+for p in fich:
+    try:
+        for line in open(p, errors="replace"):
+            try: e = json.loads(line)
+            except Exception: continue
+            m = e.get("message") or {}
+            u = m.get("usage") if isinstance(m, dict) else None
+            if not u: continue
+            try:
+                ts = datetime.datetime.fromisoformat(e.get("timestamp", "").replace("Z", "+00:00"))
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=datetime.timezone.utc)
+            except Exception: continue
+            if ts < desde_utc: continue
+            mid = m.get("id") or e.get("uuid")
+            if mid in vistos: continue
+            vistos.add(mid); sess.add(p)
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                tot[k] += u.get(k, 0) or 0
+    except Exception: pass
+if fich:
+    print(f"-- Claude Code (sessões): {len(sess)} sessão(ões), {len(vistos)} respostas")
+    print(f"   entrada nova {tot['input_tokens']} · escrita em cache {tot['cache_creation_input_tokens']} · "
+          f"lida da cache {tot['cache_read_input_tokens']} · saída {tot['output_tokens']}")
+else:
+    print("-- Claude Code: sessões não acessíveis a partir daqui")
+
+# 3) Custo fixo da memória (carregada em cada sessão de cada agente)
+mem = f"{TH}/shared/MEMORIA.md"
+if os.path.exists(mem):
+    b = os.path.getsize(mem)
+    print(f"\n-- Custo fixo: MEMORIA.md = {b} bytes ≈ {b//3.3:.0f} tokens por sessão, por agente (meta < ~1 000)")

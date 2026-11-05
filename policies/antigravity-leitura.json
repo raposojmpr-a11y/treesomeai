@@ -1,0 +1,15 @@
+{
+  "modelProvider": "gemini",
+  "permissions": {
+    "allow": [
+      "read_file(/data/data/com.termux/files/home/shared)",
+      "read_url(*)"
+    ],
+    "deny": [
+      "command(*)",
+      "execute_url(*)",
+      "mcp(*)",
+      "write_file(*)"
+    ]
+  }
+}
