@@ -108,7 +108,8 @@ correr() {
 Faz só o que é pedido. Resposta concisa: sem repetir o enunciado, sem introduções nem resumos finais. Lê da memória partilhada só o tema necessário.$([ $MODO = leitura ] && echo ' Não alteres ficheiros.')
 
 $PEDIDO"
-  local SID=""
+  local SID="" MOD=""
+  [ "$AG" = "$DEST" ] && MOD=$MODELO   # -m vale só para o agente pedido; substitutos usam o seu modelo padrão
   if [ $CONT = 1 ]; then
     SID=$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
@@ -124,7 +125,7 @@ except Exception: pass' "$SESSOES" "$ORIGEM>$AG")
   else case $AG in
     codex)
       local SB=read-only; [ $MODO = escrita ] && SB=workspace-write
-      local -a CM=(); [ -n "$MODELO" ] && CM=(-m "$MODELO")
+      local -a CM=(); [ -n "$MOD" ] && CM=(-m "$MOD")
       if [ -n "$SID" ]; then   # 'exec resume' não aceita --sandbox: impor o mesmo modo via -c
         (cd "$TH" && termux_env codex exec resume --json --skip-git-repo-check -c "sandbox_mode=\"$SB\"" "${CM[@]}" \
             -o "$TMP/resp.txt" "$SID" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
@@ -135,7 +136,7 @@ except Exception: pass' "$SESSOES" "$ORIGEM>$AG")
     gemini)
       local AM=plan
       [ "$MODO" = escrita ] && AM=accept-edits
-      local -a GM=(--model "${MODELO:-${PEDIR_GEMINI_MODEL:-gemini-3.6-flash-medium}}")
+      local -a GM=(--model "${MOD:-${PEDIR_GEMINI_MODEL:-gemini-3.6-flash-medium}}")
       [ -n "$SID" ] && GM+=(--conversation "$SID")
       local GP="$TH/shared/policies/antigravity-$MODO.json"
       echo "[pedir] Antigravity via Gemini API a trabalhar (limite ${PEDIR_TIMEOUT:-180}s)…" >&2
@@ -158,7 +159,7 @@ while True:
       wait "$VIGIA" 2>/dev/null || true; VIGIA="" ;;
     claude)
       local PM=plan; [ $MODO = escrita ] && PM=acceptEdits
-      local -a XM=(); [ -n "$MODELO" ] && XM+=(--model "$MODELO"); [ -n "$SID" ] && XM+=(--resume "$SID")
+      local -a XM=(); [ -n "$MOD" ] && XM+=(--model "$MOD"); [ -n "$SID" ] && XM+=(--resume "$SID")
       if [ $NO_UBUNTU = 1 ]; then
         (cd /root && timeout -k 10 "${PEDIR_TIMEOUT:-600}" /root/.local/bin/claude -p --output-format json --permission-mode $PM "${XM[@]}" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
       else
@@ -316,11 +317,14 @@ print(f'{s:.0f}% sessão / {w:.0f}% semana')
 sys.exit(0 if (s >= $L or w >= 98) else 1)"
 }
 
-# Há, depois de $1 na ordem, algum agente fora do banco?
+# Pesquisa sem quota no Gemini? (a leitura local continua possível)
+pesquisa_sem_quota() { [ "$1" = gemini ] && [[ "$TIPO" = pesquisa || "$TIPO" = documento ]] && ! estado_py disponivel gemini-pesquisa; }
+elegivel() { ! pesquisa_sem_quota "$1" && estado_py disponivel "$1"; }
+# Há, depois de $1 na ordem, algum agente elegível?
 ha_substituto() {
   local depois=0 a
   for a in $ORDEM; do
-    [ $depois = 1 ] && estado_py disponivel "$a" && return 0
+    [ $depois = 1 ] && elegivel "$a" && return 0
     [ "$a" = "$1" ] && depois=1
   done
   return 1
@@ -328,7 +332,7 @@ ha_substituto() {
 
 ANTERIOR=""
 for AG in $ORDEM; do
-  if [ "$AG" = gemini ] && [[ "$TIPO" = pesquisa || "$TIPO" = documento ]] && ! estado_py disponivel gemini-pesquisa; then
+  if pesquisa_sem_quota "$AG"; then
     echo "[pedir] pesquisa Google do Gemini sem quota — salto (leitura local continua disponível)" >&2
     ANTERIOR=$AG; continue
   fi
