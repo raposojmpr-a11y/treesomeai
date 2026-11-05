@@ -1,12 +1,14 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # pedir — forma única de um agente chamar outro, com registo de consumo e "braçadeira" (substituição automática)
-# Uso: pedir <codex|gemini|claude|auto> [-t tipo] [-w] [-n] "pedido"
+# Uso: pedir <codex|gemini|claude|auto> [-t tipo] [-w] [-n] [-m modelo] [-c] "pedido"
 #      agy e antigravity são aliases de gemini (Antigravity via Gemini API)
 #      pedir --estado            mostra que agentes estão "no banco" (limite atingido)
 #      pedir --livre <agente>    tira um agente do banco manualmente
 #   -t tipo : pesquisa|termux|rede|codigo|revisao|documento|outro (omissão: outro)
 #   -w      : permitir escrita (por omissão: só leitura)
 #   -n      : sem substituição (se o agente falhar, não passa a outro)
+#   -m mod  : modelo para esta chamada (ex.: haiku/sonnet no Claude, gemini-3.6-flash-low no Gemini)
+#   -c      : continua a última conversa desta origem com este agente (poupa reenviar contexto; implica -n)
 #   auto    : escolhe o titular pela cadeia do tipo de tarefa
 #   PEDIR_ORIGEM=<agente> identifica quem chama (omissão: claude no Ubuntu, termux no Termux)
 set -uo pipefail
@@ -14,6 +16,7 @@ TH=/data/data/com.termux/files/home
 TP=/data/data/com.termux/files/usr
 LOG=$TH/shared/consumo.csv
 ESTADO=$TH/shared/estado-contas.json
+SESSOES=$TH/shared/sessoes.json
 
 # Cadeias de capitania por tipo de tarefa (titular primeiro). Ajustadas nas revisões de consumo.
 cadeia() {
@@ -27,7 +30,7 @@ cadeia() {
 # Horas "no banco" após bater no limite (estimativas: janelas de ~5 h do Claude Pro e do ChatGPT; Gemini gratuito diário)
 banco_horas() { case $1 in claude) echo 5 ;; codex) echo 5 ;; gemini) echo 12 ;; esac; }
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 # --- Estado das contas (quem está no banco) ---
 estado_py() { python3 - "$ESTADO" "$@" <<'PY'
@@ -67,12 +70,13 @@ esac
 DEST=$1; shift
 case $DEST in agy|antigravity) DEST=gemini ;; esac
 case $DEST in codex|gemini|claude|auto) ;; *) usage ;; esac
-TIPO=outro; MODO=leitura; SUBST=1
-while getopts "t:wnh" o; do case $o in t) TIPO=$OPTARG ;; w) MODO=escrita ;; n) SUBST=0 ;; *) usage ;; esac; done
+TIPO=outro; MODO=leitura; SUBST=1; MODELO=""; CONT=0
+while getopts "t:wnm:ch" o; do case $o in t) TIPO=$OPTARG ;; w) MODO=escrita ;; n) SUBST=0 ;; m) MODELO=$OPTARG ;; c) CONT=1; SUBST=0 ;; *) usage ;; esac; done
 shift $((OPTIND - 1))
 case $TIPO in pesquisa|termux|rede|codigo|revisao|documento|outro) ;; *) echo "[pedir] tipo inválido: $TIPO" >&2; usage ;; esac
 [ $# -ge 1 ] || usage
 PEDIDO="$*"
+[ $CONT = 1 ] && [ "$DEST" = auto ] && { echo "[pedir] -c precisa de um agente concreto, não auto" >&2; exit 2; }
 
 NO_UBUNTU=0; [ "${container:-}" = proot-distro ] && NO_UBUNTU=1
 ORIGEM=${PEDIR_ORIGEM:-$([ $NO_UBUNTU = 1 ] && echo claude || echo termux)}
@@ -104,6 +108,14 @@ correr() {
 Faz só o que é pedido. Resposta concisa: sem repetir o enunciado, sem introduções nem resumos finais. Lê da memória partilhada só o tema necessário.$([ $MODO = leitura ] && echo ' Não alteres ficheiros.')
 
 $PEDIDO"
+  local SID=""
+  if [ $CONT = 1 ]; then
+    SID=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+except Exception: pass' "$SESSOES" "$ORIGEM>$AG")
+    [ -n "$SID" ] && echo "[pedir] ↪ continuo a conversa ${SID:0:8}… com o $AG" >&2 \
+                  || echo "[pedir] sem conversa anterior com o $AG — começo nova" >&2
+  fi
   TMP=$(mktemp -d "$TP/tmp/pedir.XXXXXX") || return 1
   CUR_TMP=$TMP
   SECONDS=0
@@ -112,12 +124,19 @@ $PEDIDO"
   else case $AG in
     codex)
       local SB=read-only; [ $MODO = escrita ] && SB=workspace-write
-      (cd "$TH" && termux_env codex exec --json --skip-git-repo-check --sandbox $SB \
-          -o "$TMP/resp.txt" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar ;;
+      local -a CM=(); [ -n "$MODELO" ] && CM=(-m "$MODELO")
+      if [ -n "$SID" ]; then   # 'exec resume' não aceita --sandbox: impor o mesmo modo via -c
+        (cd "$TH" && termux_env codex exec resume --json --skip-git-repo-check -c "sandbox_mode=\"$SB\"" "${CM[@]}" \
+            -o "$TMP/resp.txt" "$SID" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
+      else
+        (cd "$TH" && termux_env codex exec --json --skip-git-repo-check --sandbox $SB "${CM[@]}" \
+            -o "$TMP/resp.txt" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
+      fi ;;
     gemini)
       local AM=plan
       [ "$MODO" = escrita ] && AM=accept-edits
-      local -a GM=(--model "${PEDIR_GEMINI_MODEL:-gemini-3.6-flash-medium}")
+      local -a GM=(--model "${MODELO:-${PEDIR_GEMINI_MODEL:-gemini-3.6-flash-medium}}")
+      [ -n "$SID" ] && GM+=(--conversation "$SID")
       local GP="$TH/shared/policies/antigravity-$MODO.json"
       echo "[pedir] Antigravity via Gemini API a trabalhar (limite ${PEDIR_TIMEOUT:-180}s)…" >&2
       python3 -u -c 'import time
@@ -139,16 +158,18 @@ while True:
       wait "$VIGIA" 2>/dev/null || true; VIGIA="" ;;
     claude)
       local PM=plan; [ $MODO = escrita ] && PM=acceptEdits
+      local -a XM=(); [ -n "$MODELO" ] && XM+=(--model "$MODELO"); [ -n "$SID" ] && XM+=(--resume "$SID")
       if [ $NO_UBUNTU = 1 ]; then
-        (cd /root && timeout -k 10 "${PEDIR_TIMEOUT:-600}" /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
+        (cd /root && timeout -k 10 "${PEDIR_TIMEOUT:-600}" /root/.local/bin/claude -p --output-format json --permission-mode $PM "${XM[@]}" "$PROMPT") > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
       else
-        timeout -k 10 "${PEDIR_TIMEOUT:-600}" proot-distro login ubuntu -- /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT" > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
+        timeout -k 10 "${PEDIR_TIMEOUT:-600}" proot-distro login ubuntu -- /root/.local/bin/claude -p --output-format json --permission-mode $PM "${XM[@]}" "$PROMPT" > "$TMP/out" 2> "$TMP/err" < /dev/null & esperar
       fi ;;
   esac; fi
   SEG=$SECONDS
-  python3 - "$AG" "$TMP" "$RC" "$SEG" "$LOG" "$ORIGEM" "$TIPO" "$MODO" "$PEDIDO" "${ANTERIOR:--}" <<'PY'
+  python3 - "$AG" "$TMP" "$RC" "$SEG" "$LOG" "$ORIGEM" "$TIPO" "$MODO" "$PEDIDO" "${ANTERIOR:--}" "$SESSOES" <<'PY'
 import sys, json, os, csv, re, datetime, fcntl
-dest, tmp, rc, seg, log, origem, tipo, modo, pedido, anterior = sys.argv[1:11]
+dest, tmp, rc, seg, log, origem, tipo, modo, pedido, anterior, sessoes = sys.argv[1:12]
+sid = ""
 rc = int(rc)
 out = open(f"{tmp}/out", errors="replace").read()
 err = open(f"{tmp}/err", errors="replace").read()
@@ -165,6 +186,7 @@ try:
             if isinstance(u, dict):
                 tin += u.get("input_tokens", 0); tout += u.get("output_tokens", 0)
                 tcache += u.get("cached_input_tokens", 0)
+            if ev.get("type") == "thread.started": sid = ev.get("thread_id", "") or sid
             if not resp and ev.get("type") == "item.completed":
                 it = ev.get("item", {})
                 if it.get("type") == "agent_message": resp = it.get("text", "")
@@ -174,6 +196,7 @@ try:
             try: d = json.loads(out[i:]); break      # 1.º bloco JSON completo (ignora avisos antes)
             except Exception: pass
         resp = d.get("response", "") or ""
+        sid = d.get("conversation_id", "") or ""
         api_error = d.get("error")
         if d.get("status") and d["status"] != "SUCCESS":
             api_error = api_error or {"message": "Antigravity terminou com estado " + str(d["status"])}
@@ -190,6 +213,7 @@ try:
     else:
         d = json.loads(out[out.find("{"):]) if "{" in out else {}
         resp = d.get("result", "") or ""
+        sid = d.get("session_id", "") or ""
         u = d.get("usage", {}) or {}
         tcache = u.get("cache_read_input_tokens", 0)
         tin = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + tcache
@@ -237,6 +261,18 @@ try:
         w.writerow([datetime.datetime.now().isoformat(timespec="seconds"), origem, dest, tipo, modo, tin, tout, tcache, seg, estado, resumo, anterior])
 except OSError as e:
     print(f"[pedir] aviso: não consegui registar no CSV ({e})", file=sys.stderr)
+# Guarda a conversa para 'pedir -c' (por par origem>destino; escrita atómica com lock)
+if estado == "ok" and sid:
+    try:
+        with open(sessoes + ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try: ss = json.load(open(sessoes))
+            except Exception: ss = {}
+            ss[f"{origem}>{dest}"] = sid
+            with open(sessoes + ".tmp", "w") as f: json.dump(ss, f, indent=1)
+            os.replace(sessoes + ".tmp", sessoes)
+    except OSError as e:
+        print(f"[pedir] aviso: não guardei a sessão ({e})", file=sys.stderr)
 # Identificação gráfica de quem escreve: 🟠 Claude · 🟢 Codex · 🔵 Gemini
 ID = {"claude": ("🟠", "CLAUDE", "38;5;208"), "codex": ("🟢", "CODEX", "32"), "gemini": ("🔵", "ANTIGRAVITY · Gemini API", "34")}
 emo, nome, cor = ID[dest]

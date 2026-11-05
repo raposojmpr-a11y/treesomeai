@@ -30,7 +30,11 @@ elif case == 'stream':
 elif case == '429': print(json.dumps({'error': {'code':429,'message':'quota exhausted'}}))
 elif case == 'status_error': print(json.dumps({'status':'WAITING','response':'partial'}))
 elif case == 'error_response': print(json.dumps({'response':'partial','stats':{'models':{'test':{'tokens':{'prompt':14290}}}},'error':{'message':'context length exceeded'}}))
-else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'OK','usage':{'input_tokens':100,'output_tokens':10,'thinking_tokens':6,'cache_read_tokens':20},'stats':{'models':{'legacy':{'tokens':{'prompt':900,'candidates':50,'cached':400}}}}}))
+elif case == 'continuar':
+ assert sys.argv[sys.argv.index('--conversation')+1] == 'conv-123'
+ assert sys.argv[sys.argv.index('--model')+1] == 'modelo-x'
+ print(json.dumps({'status':'SUCCESS','response':'OK2','conversation_id':'conv-123','usage':{}}))
+else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','conversation_id':'conv-123','response':'OK','usage':{'input_tokens':100,'output_tokens':10,'thinking_tokens':6,'cache_read_tokens':20},'stats':{'models':{'legacy':{'tokens':{'prompt':900,'candidates':50,'cached':400}}}}}))
 ''')
     fake.chmod(0o700)
     script = base/'pedir'
@@ -38,6 +42,7 @@ else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'
     content = content.replace('LOG=$TH/shared/consumo.csv', f'LOG={base}/consumo.csv')
     content = content.replace('ESTADO=$TH/shared/estado-contas.json', f'ESTADO={base}/estado.json')
     content = content.replace('termux_env "$TH/.local/bin/agy" ', f'termux_env {fake} ')
+    content = content.replace('SESSOES=$TH/shared/sessoes.json', f'SESSOES={base}/sessoes.json')
     script.write_text(content); script.chmod(0o700)
     for case, expected, bank in [('ok','ok',False),('503','indisponivel',True),('429','limite',True),('final_stderr','limite',True),('search_quota','limite_pesquisa',False),('error_response','erro',False),('status_error','erro',False),('timeout','tempo',False),('stream','interrompido',False)]:
         (base/'estado.json').write_text('{}')
@@ -64,6 +69,12 @@ else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'
             diag = (base/'diagnosticos/gemini-ultimo-erro.txt').read_text()
             assert 'AIza' not in diag and 'AIza' not in proc.stderr
         print(f'{case}: OK')
+    # -c reutiliza a conversa guardada pelo caso 'ok'; -m passa o modelo
+    assert json.loads((base/'sessoes.json').read_text()) == {'codex>gemini': 'conv-123'}
+    env = dict(os.environ, CASO_TESTE='continuar', PEDIR_ORIGEM='codex', PEDIR_TIMEOUT='5')
+    proc = subprocess.run([str(script),'gemini','-c','-m','modelo-x','segunda pergunta'],env=env,text=True,capture_output=True,timeout=15)
+    assert proc.returncode == 0 and 'OK2' in proc.stdout and 'continuo a conversa' in proc.stderr, proc.stderr
+    print('continuar: OK')
     # SIGTERM ao pedir: termina o agente, sai com 130 e não deixa temporários
     import signal, time, glob
     pidf = base/'agente.pid'
@@ -83,4 +94,4 @@ else: print('Aviso antes do JSON\\n'+json.dumps({'status':'SUCCESS','response':'
     assert not vivo, 'agente ficou órfão'
     assert set(glob.glob('/data/data/com.termux/files/usr/tmp/pedir.*')) <= antes, 'temporários ficaram'
     print('sinal: OK')
-print('10 regressões offline passaram; nenhuma chamada a agentes.')
+print('11 regressões offline passaram; nenhuma chamada a agentes.')
