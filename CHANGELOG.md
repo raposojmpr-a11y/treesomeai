@@ -5,6 +5,7 @@ Regra: cada alteração ao código entra aqui, no mesmo commit.
 ## [Por lançar]
 ### Adicionado
 - README: secção "O que faz"; repositório publicado no GitHub. (claude)
+- README em inglês. (claude)
 
 ## [0.1.0] — 2026-11-05
 ### Adicionado

@@ -1,56 +1,59 @@
 # TreeSomeAI
 
-Equipa de três agentes de IA (🟠 Claude · 🟢 Codex · 🔵 Gemini/Antigravity) a trabalhar em conjunto
-num Nothing Phone (1): Termux + Ubuntu (proot-distro).
+A team of three AI agents (🟠 Claude · 🟢 Codex · 🔵 Gemini/Antigravity) working together
+on a Nothing Phone (1): Termux + Ubuntu (proot-distro).
 
-| Ferramenta | Função |
+| Tool | Purpose |
 |---|---|
-| `bin/pedir` | um agente chama outro, com registo de consumo e "braçadeira" (substituição automática quando um fica sem tokens) |
-| `bin/saldo` | quanto resta das contas de cada agente, sem gastar tokens |
-| `bin/rever-consumo` | resumo do consumo de tokens |
-| `policies/` | permissões do Antigravity/Gemini por modo (leitura/escrita) |
-| `tests/` | testes de regressão offline |
+| `bin/pedir` | one agent calls another, with usage logging and the "captain's armband" (automatic handover when one runs out of tokens) |
+| `bin/saldo` | how much is left on each agent's account, without spending tokens |
+| `bin/rever-consumo` | token usage report |
+| `policies/` | Antigravity/Gemini permissions per mode (read-only/write) |
+| `tests/` | offline regression tests |
 
-Memória partilhada (fora do repositório): `MEMORIA.md` + `temas/`.
+Shared memory (outside the repository): `MEMORIA.md` + `temas/`.
 
-## O que faz
+> The command names and the tools' messages are in Portuguese (`pedir` = ask, `saldo` = balance,
+> `rever-consumo` = review usage).
 
-### 📨 `pedir`: um agente chama outro
-`pedir <codex|gemini|claude|auto> [-t tipo] [-w] [-n] [-m modelo] [-c] "pedido"`
-- É a forma única de um agente pedir trabalho a outro. Por omissão só leitura; com `-w` pode escrever.
-- `-t` indica o tipo de tarefa; com `auto`, a cadeia escolhe quem a faz:
+## What it does
 
-| Tipo | Cadeia |
+### 📨 `pedir`: one agent calls another
+`pedir <codex|gemini|claude|auto> [-t type] [-w] [-n] [-m model] [-c] "request"`
+- The single way for one agent to hand work to another. Read-only by default; `-w` allows writing.
+- `-t` sets the task type; with `auto`, the chain picks who does it:
+
+| Type (`-t`) | Chain |
 |---|---|
-| pesquisa, documento | Gemini → Claude → Codex |
-| termux, rede, codigo | Codex → Claude → Gemini |
-| revisao | Codex → Gemini → Claude |
-| outro | Claude → Codex → Gemini |
+| `pesquisa` (research), `documento` (document) | Gemini → Claude → Codex |
+| `termux`, `rede` (network), `codigo` (code) | Codex → Claude → Gemini |
+| `revisao` (review) | Codex → Gemini → Claude |
+| `outro` (other) | Claude → Codex → Gemini |
 
-- **Braçadeira automática:** se o agente bate no limite (ou está a ≥90%), o pedido passa ao próximo da cadeia e o agente fica "no banco" (Claude/Codex 5 h, Gemini 12 h). Ver com `pedir --estado`.
-- `-m` escolhe o modelo para essa chamada; `-c` continua a conversa anterior sem reenviar contexto.
-- Se a ligação cai a meio, repete uma vez. Cada chamada fica registada em `consumo.csv`.
+- **Automatic armband handover:** if an agent hits its limit (or is at ≥90%), the request goes to the next one in the chain and the agent is "benched" (Claude/Codex 5 h, Gemini 12 h). Check with `pedir --estado`.
+- `-m` picks the model for that call; `-c` continues the previous conversation without resending context; `-n` disables handover.
+- If the connection drops mid-answer, it retries once. Every call is logged to `consumo.csv`.
 
-### 📊 `saldo`: quanto resta de cada conta, com 0 tokens
-- Claude: lê o ecrã `/usage` numa sessão tmux escondida (~15 s).
-- Codex: lê os limites gravados na última sessão.
-- Gemini: ainda sem medição.
-- Guarda em `saldo.json`, que o `pedir` usa para passar a braçadeira **antes** do limite.
+### 📊 `saldo`: account balance, at 0 tokens
+- Claude: reads the `/usage` screen in a hidden tmux session (~15 s).
+- Codex: reads the rate limits saved in its last session.
+- Gemini: not measured yet.
+- Saves to `saldo.json`, which `pedir` uses to hand over the armband **before** the limit is hit.
 
-### 📈 `rever-consumo`: relatório de gastos
-- Junta as chamadas entre agentes e as sessões do Claude/Codex (últimos 7 dias por omissão).
-- Serve para ajustar as cadeias de encaminhamento.
+### 📈 `rever-consumo`: usage report
+- Combines agent-to-agent calls with Claude/Codex sessions (last 7 days by default).
+- Used to tune the routing chains.
 
-### 🛡️ Por trás
-- Políticas de sandbox (leitura/escrita) para o Antigravity e o Gemini.
-- 11 testes automáticos offline.
-- Histórico de alterações em [`CHANGELOG.md`](CHANGELOG.md).
+### 🛡️ Under the hood
+- Sandbox policies (read-only/write) for Antigravity and Gemini.
+- 11 offline automated tests.
+- Change history in [`CHANGELOG.md`](CHANGELOG.md) (Portuguese).
 
-## Uso rápido
+## Quick start
 ```
-pedir codex -t revisao "revê bin/x:10-40"      # chamada nova, só leitura
-pedir codex -c "e a linha 55?"                  # continua a mesma conversa (sem reenviar contexto)
-pedir claude -m haiku "resume este log"         # modelo por chamada
-pedir --estado                                  # quem está no banco
-python3 tests/test-pedir-gemini.py              # regressões offline (sem gastar tokens)
+pedir codex -t revisao "review bin/x:10-40"     # new call, read-only
+pedir codex -c "and line 55?"                   # continue the same conversation (no context resent)
+pedir claude -m haiku "summarise this log"      # model per call
+pedir --estado                                  # who is benched
+python3 tests/test-pedir-gemini.py              # offline regression tests (no tokens spent)
 ```
